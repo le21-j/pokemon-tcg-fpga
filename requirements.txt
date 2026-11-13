@@ -1,0 +1,4 @@
+-r project/requirements-colab.txt
+nbformat>=5
+nbclient>=0.10
+ipykernel>=6

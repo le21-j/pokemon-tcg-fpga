@@ -1,0 +1,13 @@
+Pokémon TCG AI with FPGA inference
+Project implementation and modifications by le21-j and contributors.
+
+This project includes code adapted from "Reinforcement Learning and MCTS sample code"
+by Kiyota (Kaggle user kiyotah):
+https://www.kaggle.com/code/kiyotah/reinforcement-learning-and-mcts-sample-code
+The upstream notebook is published under the Apache License, Version 2.0.
+
+The adapted notebook retains the original Transformer, sparse feature encoders,
+MCTS, and batching function/class definitions. Local modifications cover runtime
+setup, vocabulary bounds, configurable run sizes, draw handling, partial batches,
+native cleanup, checkpoints, and agent export. The portable RL modules make
+additional search/belief and inference integration changes described in their files.
