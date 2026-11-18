@@ -8,6 +8,7 @@ Open a notebook and select **Runtime → Run all**. Setup clones this public rep
 
 | Notebook | Purpose | Colab |
 | --- | --- | --- |
+| [Deep Sets training](project/deep_sets_training.ipynb) | Generate native games, train the evaluator with self-play, and verify a reloaded checkpoint | [Open](https://colab.research.google.com/github/le21-j/pokemon-tcg-fpga/blob/main/project/deep_sets_training.ipynb) |
 | [Team arena](project/arena.ipynb) | Compare Python agents or checkpoints in first-to-three series | [Open](https://colab.research.google.com/github/le21-j/pokemon-tcg-fpga/blob/main/project/arena.ipynb) |
 | [Sample agent](project/sample_agent.ipynb) | Test and package the teammate inference template | [Open](https://colab.research.google.com/github/le21-j/pokemon-tcg-fpga/blob/main/project/sample_agent.ipynb) |
 | [Reinforcement learning](project/reinforcement_learning.ipynb) | The supplied Transformer/MCTS sample, with short section notes | [Open](https://colab.research.google.com/github/le21-j/pokemon-tcg-fpga/blob/main/project/reinforcement_learning.ipynb) |

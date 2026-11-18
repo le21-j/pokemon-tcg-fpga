@@ -29,7 +29,8 @@ def main():
         fixture = parent / "git-fixture"
         required = ("project/arena.py", "project/sample_sdk.py", "project/agent/model.py",
                     "project/rl_baseline/train.py", "project/agent_template/agent.py",
-                    "project/requirements-colab.txt")
+                    "project/requirements-colab.txt", "project/train_deep_sets.py",
+                    "project/check_deep_sets_training.py")
         for name in required:
             target = fixture / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +46,7 @@ def main():
             again = colab_setup.setup_project(repository_url=str(fixture), in_colab=True,
                                              workspace_parent=parent / "fresh")
             assert root == again
-            (root / "project/arena.py").unlink()
+            (root / "project/train_deep_sets.py").unlink()
             (root / "keep-my-work.txt").write_text("Preserve an incomplete checkout")
             recovered = colab_setup.setup_project(repository_url=str(fixture), in_colab=True,
                                                  workspace_parent=parent / "fresh")
@@ -61,7 +62,7 @@ def main():
                     pass
                 else:
                     raise AssertionError("An unavailable repository must report a clone failure")
-    print("PASS: four snapshot-free notebooks, direct Git clone, pip command, caching, recovery and clone errors")
+    print(f"PASS: {len(NOTEBOOKS)} notebooks, direct Git clone, pip command, caching, recovery and clone errors")
 
 
 if __name__ == "__main__":

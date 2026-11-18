@@ -1,4 +1,4 @@
-"""Synchronize the small public-repository setup cell in all four notebooks."""
+"""Synchronize the public-repository setup cell in the project notebooks."""
 
 from pathlib import Path
 
@@ -6,7 +6,8 @@ import nbformat
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOKS = ("arena.ipynb", "sample_agent.ipynb", "reinforcement_learning.ipynb", "deep_sets_walkthrough.ipynb")
+NOTEBOOKS = ("arena.ipynb", "sample_agent.ipynb", "reinforcement_learning.ipynb",
+             "deep_sets_walkthrough.ipynb", "deep_sets_training.ipynb")
 SETUP_END = "# --- End automatic project setup ---"
 
 

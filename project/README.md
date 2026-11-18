@@ -1,12 +1,30 @@
 # Pokémon TCG AI with FPGA inference
 
-Project proposal for EEE 405/591. Updated November 12, 2026.
+Project proposal for EEE 405/591. Updated November 18, 2026.
 
 Planning update, October 29, 2026: the target board is the **DE10-Lite**, and training resources include **ASU Sol**. Read the [architecture and training plan](architecture-and-training-plan.md) for the proposed model, training stages, software/RTL split, and evaluation gates. The [competition research](competition-research.md) distinguishes verified interfaces from data still awaiting inspection.
 
 The November 8 [model comparison research](model-options-research.md) compares PPO, imitation learning, Monte Carlo value learning, search distillation, pooled entity networks, and boosted trees for this task and board.
 
 The current November 12 [NNUE-style Deep Sets plan](openjev-tcg-adaptation-plan.md) defines an **8,865-parameter position evaluator**, incremental updates and saved positions on the DE10-Lite, search on the PC, and completed-match value learning on Sol. The [hardware co-design plan](architecture-and-training-plan.md) summarizes numeric, memory, protocol, and verification budgets. The [small-model comparison](small-model-architecture-research.md) covers value-model alternatives. LSTMs remain excluded. The [Open-Jev source review](openjev-source-research.md) records earlier SDK research.
+
+## Train the Deep Sets agent
+
+Start the [Deep Sets training notebook in Colab](https://colab.research.google.com/github/le21-j/pokemon-tcg-fpga/blob/main/project/deep_sets_training.ipynb) and select **Runtime → Run all**. A CPU runtime is sufficient. The notebook can also use CUDA for fitting the weights. To run the same experiment from a Python environment with PyTorch installed, use a new output directory.
+
+```bash
+python -m project.train_deep_sets --download --output project/results/deep-sets/first-run --epochs 2
+python -m project.check_deep_sets_training --run-dir project/results/deep-sets/first-run
+```
+
+1. Priority and Random play four games with the sample water deck. Two separate games provide validation positions for both training stages.
+2. Both the shared card encoder and the value MLP learn the acting player's final return (+1, 0, or −1). AdamW uses a learning rate of 0.0003 and Huber loss uses delta 0.2. The game calls and value optimizer follow the [supplied training example](https://www.kaggle.com/code/kiyotah/reinforcement-learning-and-mcts-sample-code).
+3. Two frozen copies of the warmup checkpoint play each other for two games. The native engine supplies the legal choices. The host samples one compatible hidden world, compares one-step continuations, and returns a list of selected option indices. A forced move needs no evaluation. Search records fallbacks when it cannot construct a compatible world or preserve root options.
+4. Training resumes from the warmup optimizer and weights on the combined warmup and self-play positions. Each stage saves its best updated epoch by held-out loss. The final checkpoint plays two new games against Random with seats exchanged. The JSON report includes the game IDs, policy/search counts, data hashes, device, losses and results. Python seeds cover agent choices and model initialization. The native engine shuffles decks independently.
+
+Each decision row in the JSONL files contains the acting seat, visible observation, selected indices and outcome. The model encodes card IDs, HP, Energy and Tool counts, statuses, turn resources and selection facts. Four 16-channel sums cover own board, opponent board, own hand and public discards. The value head receives those sums, 32 global features and 32 reserved history inputs. It produces one scalar from the acting player's perspective. At inference, the host flips a simulated leaf value if the seat changes. Full and incremental evaluation share all 8,865 parameters.
+
+Use `model.pt` with **Deep Sets checkpoint** in the [team arena](arena.ipynb). For the one-argument Kaggle interface, wrap a loaded policy with `kaggle_agent(policy, own_deck)`. At the deck prompt it returns 60 card IDs. Subsequent calls return legal option indices. The smoke test checks both phases, converts real decisions with the sample's `cg.api` helper, and checks incremental values across self-play. Training labels refer to individual games. Match-level best-of-three rewards, deeper search, cross-deck evaluation and FPGA timing remain separate experiments.
 
 ## Running the Python prototype
 
@@ -38,7 +56,7 @@ The notebook offers named decks, random selection from the native-validated pool
 
 Script response times include process communication, preprocessing, search/policy work, and inference. They exclude worker startup and import-time weight loading. Reports hash entry scripts, but separately loaded weights are managed by each script; use a competitor name that identifies the model version.
 
-Saved value models choose actions through a native one-step search baseline using compatible-deck priors. Its coverage/fallback counters are displayed. The native search/metadata bindings were verified against the original public Kiyota `cg-lib` v9 wrapper, then tested with the pinned macOS engine. Python seeds control agent/deck/belief sampling; native shuffles have no exposed seed argument. The notebook records first-observed hand IDs/fingerprints for inspecting fresh deals. Source wrappers and example-deck provenance are linked inside the notebook.
+Saved value models use native search and an explicit opponent deck prior. For each legal candidate considered, the search reads a child of the same simulated parent. It updates cached sums for same-observer leaves and rebuilds the position for a new observer. The search considers up to 128 candidates per decision and counts capped decisions and fallbacks.
 
 Run these commands from the repository root using its existing Python 3.12 environment:
 
@@ -73,7 +91,7 @@ When an ordinary attachment is captured, check the actual before/after observati
 
 The learner uses AdamW at `3e-4`. `--loss huber` adapts the notebook's value-loss delta of `0.2`; the default `--loss mse` follows the position-value plan. Both train the encoder and value head jointly on completed-game returns. Train/validation separation groups complete games, retaining both players together. The best validation checkpoint includes model/optimizer/RNG state, feature definitions, dataset hash, and split IDs. A JSON report records all epochs. Add `--checkpoint project/checkpoints/demo-huber.pt` to the attachment command to check that saved model. Checkpoint loading is implemented; interrupted-run resume is a later addition.
 
-The observed-resources-v0 feature schema uses HP, attachment counts, roles, statuses, counts, and selection type. Card identities/mechanics need the audited metadata encoder, and the 32 history slots are currently zero. Native games, floating-point model tests, the first-to-three arena, and one-step model-agent search have run locally on macOS ARM64. Deeper/fixed-observer search, quantized inference, Kaggle BO3 integration, FPGA execution, and Sol execution remain planned. Raw-dictionary native metadata/search bindings are now implemented in `agent/native_search.py`; the complete original `cg.api` dataclass wrapper is separate. See the [API and optimization findings](kaggle-api-implementation-research.md) for source references and recorded evidence.
+New runs use `observed-card-id-v1`. Three normalized base-32 digits encode each visible card's catalog ID within the existing 16-input width. These digits identify the card. The model must learn its role from gameplay. The 32 history slots currently hold zeros. Saved v0 checkpoints still use their original resource-only schema. [Earlier API and optimization experiments](kaggle-api-implementation-research.md)
 
 | Implementation | Purpose |
 | --- | --- |

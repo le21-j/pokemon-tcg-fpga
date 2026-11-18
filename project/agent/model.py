@@ -10,16 +10,18 @@ def batch_positions(positions: list[Position], device="cpu") -> tuple[Tensor, ..
     if not positions:
         raise ValueError("empty position batch")
     count = max(len(p.entities) for p in positions)
-    entities = torch.zeros(len(positions), count, 16, device=device)
-    groups = torch.zeros(len(positions), count, dtype=torch.long, device=device)
-    mask = torch.zeros(len(positions), count, device=device)
+    # Positions are encoded on the host; transfer complete tensors to the trainer.
+    entities = torch.zeros(len(positions), count, 16)
+    groups = torch.zeros(len(positions), count, dtype=torch.long)
+    mask = torch.zeros(len(positions), count)
     for row, position in enumerate(positions):
-        for col, entity in enumerate(position.entities):
-            entities[row, col] = entity.features.to(device)
-            groups[row, col] = int(entity.group)
-            mask[row, col] = 1
-    return (entities, groups, torch.stack([p.globals for p in positions]).to(device),
-            torch.stack([p.history for p in positions]).to(device), mask)
+        size = len(position.entities)
+        if size:
+            entities[row, :size] = torch.stack([e.features for e in position.entities])
+            groups[row, :size] = torch.tensor([int(e.group) for e in position.entities])
+            mask[row, :size] = 1
+    return (entities.to(device), groups.to(device), torch.stack([p.globals for p in positions]).to(device),
+            torch.stack([p.history for p in positions]).to(device), mask.to(device))
 
 
 class DeepSetsValue(nn.Module):

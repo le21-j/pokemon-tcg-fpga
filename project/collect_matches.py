@@ -1,7 +1,7 @@
 """Run native CABT games and collect acting-player observations with outcomes.
 
 Uses the same battle_start/select/finish entry points as the Kaggle notebook.
-The public runtime has no cg.api search helpers. Games here are individual games.
+Games here are individual games. A caller can supply a policy for each seat.
 """
 
 import argparse
@@ -93,9 +93,28 @@ def public_observation(observation: dict) -> dict:
     return {key: value for key, value in observation.items() if key != "search_begin_input"}
 
 
-def collect_game(game, sim, rng, game_id, max_steps):
+def validate_action(observation, action):
+    selection = observation["select"]
+    if (not isinstance(action, list) or any(type(i) is not int for i in action) or
+            len(set(action)) != len(action) or
+            not selection["minCount"] <= len(action) <= selection["maxCount"] or
+            any(i < 0 or i >= len(selection["option"]) for i in action)):
+        raise ValueError(f"agent returned an invalid selection: {action}")
+
+
+def game_return(result, observer):
+    if result not in (0, 1, 2) or observer not in (0, 1):
+        raise ValueError(f"invalid native outcome/perspective: {result}/{observer}")
+    return 0.0 if result == 2 else (1.0 if result == observer else -1.0)
+
+
+def collect_game(game, sim, rng, game_id, max_steps, *, actions=(choose_random, choose_random),
+                 decks=(DEFAULT_DECK, DEFAULT_DECK)):
     records, attachment = [], None
-    observation, start = game.battle_start(DEFAULT_DECK, DEFAULT_DECK)
+    for action, deck in zip(actions, decks, strict=True):
+        if hasattr(action, "start_game"):
+            action.start_game(list(deck))
+    observation, start = game.battle_start(*decks)
     try:
         if start.errorPlayer >= 0 or observation is None:
             raise RuntimeError(f"deck/start error: player={start.errorPlayer}, type={start.errorType}")
@@ -103,8 +122,9 @@ def collect_game(game, sim, rng, game_id, max_steps):
             if len(records) >= max_steps:
                 raise RuntimeError(f"game exceeded {max_steps} selections; no outcome labels written")
             before = public_observation(observation)
-            choice = choose_random(observation, rng)
             observer = observation["current"]["yourIndex"]
+            choice = actions[observer](observation, rng)
+            validate_action(observation, choice)
             records.append({"game_id": game_id, "match_id": game_id, "observer": observer,
                             "step": len(records), "observation": before, "action": choice})
             is_attachment = (len(choice) == 1 and
@@ -119,7 +139,7 @@ def collect_game(game, sim, rng, game_id, max_steps):
             raise ValueError(f"unexpected native result {result}")
         for record in records:
             record["result"] = result
-            record["target"] = 0.0 if result == 2 else (1.0 if result == record["observer"] else -1.0)
+            record["target"] = game_return(result, record["observer"])
         return records, attachment, result
     finally:
         if sim.Battle.battle_ptr:

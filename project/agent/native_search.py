@@ -68,7 +68,7 @@ class NativeSearch:
         self.lib.SearchEnd(self.agent_pointer)
 
 
-def known_cards(player):
+def known_cards(player, public_cards=()):
     """Count visible physical instances once, including nested attached/evolved cards."""
     instances = {}
 
@@ -84,21 +84,30 @@ def known_cards(player):
 
     for zone in ("active", "bench", "hand", "discard", "prize"):
         visit(player.get(zone))
+    for card in public_cards:
+        visit(card)
     return Counter(instances.values())
 
 
 def predict_hidden_cards(observation, own_deck, possible_opponent_decks, rng):
     """Sample compatible deck priors; no access to the opponent's selected deck.
 
-    Strict accounting skips contexts whose limbo/stadium cards need more history.
+    Strict accounting skips contexts whose temporary zones need more history.
     The caller records a fallback for those unsupported belief contexts.
     """
     state = observation["current"]
     own = state["players"][state["yourIndex"]]
-    opponent = state["players"][1 - state["yourIndex"]]
+    # CABT redacts the opponent's hand. Keep that boundary even for enriched replays.
+    opponent = {**state["players"][1 - state["yourIndex"]], "hand": None}
     if any(card is None for player in (own, opponent) for card in player["active"]):
         raise ValueError("face-down setup requires a dedicated belief handler")
-    own_known, opponent_known = known_cards(own), known_cards(opponent)
+    stadium = state.get("stadium") or []
+
+    def visible(player, seat):
+        return known_cards(player, (card for card in stadium if card["playerIndex"] == seat))
+
+    own_known = visible(own, state["yourIndex"])
+    opponent_known = visible(opponent, 1 - state["yourIndex"])
     compatible = [deck for deck in possible_opponent_decks if not (opponent_known - Counter(deck))]
     if not compatible:
         raise ValueError("public opponent cards do not match the configured deck priors")
@@ -123,6 +132,9 @@ def predict_hidden_cards(observation, own_deck, possible_opponent_decks, rng):
     own_remaining, own_prizes, _ = partition(own, own_deck, own_known, False)
     opponent_remaining, opponent_prizes, opponent_hand = partition(
         opponent, opponent_prior, opponent_known, True)
+    # cg.api uses the actual visible deck for deck-search selections.
+    if observation["select"].get("deck") is not None:
+        own_remaining = []
     return {"your_deck": own_remaining, "your_prize": own_prizes,
             "opponent_deck": opponent_remaining, "opponent_prize": opponent_prizes,
             "opponent_hand": opponent_hand, "opponent_active": []}

@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from .agent.evaluator import IncrementalEvaluator
-from .agent.features import Position, SCHEMA_ID, position_from_observation
+from .agent.features import Position, SCHEMA_ID, SUPPORTED_SCHEMAS, position_from_observation
 from .agent.model import DeepSetsValue, batch_positions
 
 
@@ -72,14 +72,14 @@ def check_attachment(model, before, after):
     return evaluator
 
 
-def check_game_traces(model, path):
+def check_game_traces(model, path, schema_id=SCHEMA_ID):
     caches = {}
     maximum_error, count = 0.0, 0
     game_ids = set()
     with path.open() as stream:
         for line in stream:
             record = json.loads(line)
-            position = position_from_observation(record["observation"])
+            position = position_from_observation(record["observation"], schema_id=schema_id)
             key = (record["game_id"], position.observer)
             if key not in caches:
                 caches[key] = IncrementalEvaluator(model)
@@ -110,10 +110,12 @@ def main():
         parser.error("provide both --before and --after")
     torch.manual_seed(7)
     model = DeepSetsValue().eval()
+    schema_id = SCHEMA_ID
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-        if checkpoint["metadata"]["schema_id"] != SCHEMA_ID:
-            raise ValueError("checkpoint feature schema does not match this encoder")
+        schema_id = checkpoint["metadata"]["schema_id"]
+        if schema_id not in SUPPORTED_SCHEMAS:
+            raise ValueError(f"unknown checkpoint feature schema {schema_id!r}")
         model.load_state_dict(checkpoint["model"])
         print(f"Checkpoint epoch:      {checkpoint['epoch']}")
     parameter_count = sum(p.numel() for p in model.parameters())
@@ -125,9 +127,9 @@ def main():
         print("Input source:          native observation files")
     else:
         first, second, third = example_observations()
-        observations, alternative = (first, second), position_from_observation(third)
+        observations, alternative = (first, second), position_from_observation(third, schema_id=schema_id)
         print("Input source:          synthetic attachment fixture")
-    before, after = map(position_from_observation, observations)
+    before, after = (position_from_observation(obs, schema_id=schema_id) for obs in observations)
     with torch.inference_mode():
         evaluator = check_attachment(model, before, after)
         if alternative:
@@ -137,12 +139,12 @@ def main():
             evaluator.pop()
         reversed_after = replace(after, entities=tuple(reversed(after.entities)))
         torch.testing.assert_close(model.evaluate_position(after), model.evaluate_position(reversed_after))
-        empty = Position((), torch.zeros(32), torch.zeros(32), before.observer)
+        empty = Position((), torch.zeros(32), torch.zeros(32), before.observer, schema_id)
         batched = model(*batch_positions([before, after, empty]))
         for index, position in enumerate([before, after, empty]):
             torch.testing.assert_close(batched[index], model.evaluate_position(position))
         if args.dataset:
-            check_game_traces(model, args.dataset)
+            check_game_traces(model, args.dataset, schema_id)
 
     # Both learned components must receive gradients through the grouped sums.
     loss = (model(*batch_positions([before, after])) - 1).square().mean()

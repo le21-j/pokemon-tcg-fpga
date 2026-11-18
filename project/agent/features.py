@@ -1,8 +1,4 @@
-"""Observed-state prototype schema, without card-ID or hidden-state inputs.
-
-v0 represents resources/status but needs card metadata before strategic training.
-History slots are zero until an audited persistent-history encoder is added.
-"""
+"""Versioned features from the acting player's visible CABT observation."""
 
 from dataclasses import dataclass
 from enum import IntEnum
@@ -18,12 +14,20 @@ class Group(IntEnum):
     PUBLIC_DISCARD = 3
 
 
-SCHEMA_ID = "observed-resources-v0"
-ENTITY_FEATURES = (
+LEGACY_SCHEMA_ID = "observed-resources-v0"
+SCHEMA_ID = "observed-card-id-v1"
+SUPPORTED_SCHEMAS = (LEGACY_SCHEMA_ID, SCHEMA_ID)
+LEGACY_ENTITY_FEATURES = (
     "hp_div_400", "energy_units_div_10", "energy_cards_div_10",
     "tools_div_4", "active", "bench", "own", "hand", "discard",
     "appeared_this_turn", "poisoned", "burned", "asleep", "paralyzed",
     "confused", "pokemon",
+)
+ENTITY_FEATURES = (
+    "card_id_low5_div_31", "card_id_middle5_div_31", "card_id_high5_div_31",
+    "hp_div_400", "max_hp_div_400", "energy_units_div_10", "energy_cards_div_10",
+    "tools_div_4", "active", "own", "appeared_this_turn",
+    "poisoned", "burned", "asleep", "paralyzed", "confused",
 )
 GLOBAL_FEATURES = (
     "turn_div_100", "turn_actions_div_100", "observer_started",
@@ -66,8 +70,10 @@ class Position:
                 raise ValueError("global/history features must be 32 finite values")
 
 
-def position_from_observation(observation: dict) -> Position:
+def position_from_observation(observation: dict, schema_id: str = SCHEMA_ID) -> Position:
     """Encode one acting-player observation from cg.game, ignoring opaque data."""
+    if schema_id not in SUPPORTED_SCHEMAS:
+        raise ValueError(f"unsupported feature schema: {schema_id}")
     state = observation.get("current")
     selection = observation.get("select")
     if state is None or selection is None:
@@ -90,17 +96,27 @@ def position_from_observation(observation: dict) -> Position:
                     Group.OWN_HAND if zone == "hand" else Group.PUBLIC_DISCARD
                 )
                 active = zone == "active"
-                values = [
+                resources = [
                     card.get("hp", 0) / 400,
                     len(card.get("energies") or []) / 10,
                     len(card.get("energyCards") or []) / 10,
                     len(card.get("tools") or []) / 4,
-                    active, zone == "bench", own, zone == "hand", zone == "discard",
-                    card.get("appearThisTurn", False),
-                    *(bool(player.get(status, False)) and active for status in
-                      ("poisoned", "burned", "asleep", "paralyzed", "confused")),
-                    board,
                 ]
+                appeared = card.get("appearThisTurn", False)
+                statuses = [active and bool(player.get(status, False)) for status in
+                            ("poisoned", "burned", "asleep", "paralyzed", "confused")]
+                if schema_id == LEGACY_SCHEMA_ID:
+                    values = [*resources, active, zone == "bench", own, zone == "hand",
+                              zone == "discard", appeared, *statuses, board]
+                else:
+                    # A stable public catalog ID distinguishes cards in any deck.
+                    # Three base-32 digits fit the FPGA input width without an embedding table.
+                    card_id = card["id"]
+                    if type(card_id) is not int or not 0 <= card_id < 32**3:
+                        raise ValueError(f"card ID outside the v1 feature range: {card_id}")
+                    digits = [((card_id >> shift) & 31) / 31 for shift in (0, 5, 10)]
+                    values = [*digits, resources[0], card.get("maxHp", 0) / 400,
+                              *resources[1:], active, own, appeared, *statuses]
                 entities.append(Entity(
                     f"player{owner}:card{card['serial']}", group,
                     torch.tensor(values, dtype=torch.float32),
@@ -120,4 +136,4 @@ def position_from_observation(observation: dict) -> Position:
         *(selection["type"] == i for i in range(14)),
     ]
     return Position(tuple(entities), torch.tensor(values, dtype=torch.float32),
-                    torch.zeros(32), observer)
+                    torch.zeros(32), observer, schema_id)

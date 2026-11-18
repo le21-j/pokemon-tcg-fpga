@@ -15,10 +15,12 @@ import zipfile
 
 import torch
 
-from .agent.features import SCHEMA_ID, position_from_observation
+from .agent.evaluator import IncrementalEvaluator
+from .agent.features import SCHEMA_ID, SUPPORTED_SCHEMAS, position_from_observation
 from .agent.model import DeepSetsValue
 from .agent.native_search import predict_hidden_cards
-from .collect_matches import DEFAULT_DECK, ENGINE_ROOT, choose_random
+from .collect_matches import DEFAULT_DECK, ENGINE_ROOT, choose_random, validate_action
+from .rl_baseline.model import candidate_actions
 
 
 EXAMPLE_DECKS = {
@@ -85,27 +87,33 @@ def priority_action(observation, rng):
 
 
 class ValueSearchAgent:
-    """One sampled hidden world, one native step per legal single-choice option.
+    """Evaluate one native step per candidate in the same sampled hidden world.
 
-    Leaf values use the acting player's view and are aligned to the root player.
-    Unsupported belief/selection contexts use a counted legal baseline fallback.
+    The sample's bounded candidate generator covers optional and ordered choices.
+    A partial candidate set is randomly relabeled to avoid favoring low indices.
+    Leaf values use the simulated acting player's view, aligned to the root seat.
     """
-    def __init__(self, model, search_api, opponent_deck_priors, max_candidates=128):
+    def __init__(self, model, search_api, opponent_deck_priors, max_candidates=128,
+                 schema_id=SCHEMA_ID):
+        if max_candidates < 2:
+            raise ValueError("allow at least two candidates for move comparison")
+        if schema_id not in SUPPORTED_SCHEMAS:
+            raise ValueError(f"unsupported checkpoint feature schema: {schema_id}")
         self.model = model.eval()
         self.api = search_api
         self.priors = [list(deck) for deck in opponent_deck_priors]
         self.max_candidates = max_candidates
+        self.schema_id = schema_id
         self.own_deck = None
         self.stats = Counter()
 
     @classmethod
     def from_checkpoint(cls, path, search_api, opponent_deck_priors, **kwargs):
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if checkpoint["metadata"]["schema_id"] != SCHEMA_ID:
-            raise ValueError("checkpoint feature schema mismatch")
         model = DeepSetsValue()
         model.load_state_dict(checkpoint["model"])
-        return cls(model, search_api, opponent_deck_priors, **kwargs)
+        return cls(model, search_api, opponent_deck_priors,
+                   schema_id=checkpoint["metadata"]["schema_id"], **kwargs)
 
     def start_game(self, own_deck):
         self.own_deck = list(own_deck)
@@ -113,42 +121,64 @@ class ValueSearchAgent:
 
     @torch.inference_mode()
     def __call__(self, observation, rng):
-        selection = observation["select"]
-        count = len(selection["option"])
-        if (selection["minCount"] != 1 or selection["maxCount"] != 1 or
-                count < 2 or count > self.max_candidates):
-            self.stats["selection_fallbacks"] += 1
-            return priority_action(observation, rng)
         if self.own_deck is None:
             raise RuntimeError("start_game must supply this agent's own deck")
+        selection = observation["select"]
+        actions = candidate_actions(selection, self.max_candidates + 1)
+        if len(actions) == 1:
+            self.stats["forced_decisions"] += 1
+            return actions[0]
+        if len(actions) > self.max_candidates:
+            self.stats["capped_decisions"] += 1
+            indices = list(range(len(selection["option"])))
+            rng.shuffle(indices)
+            actions = [[indices[i] for i in action] for action in actions[:self.max_candidates]]
         try:
             predictions = predict_hidden_cards(observation, self.own_deck, self.priors, rng)
         except ValueError:
             self.stats["belief_fallbacks"] += 1
             return priority_action(observation, rng)
         root_player = observation["current"]["yourIndex"]
-        best_index, best_score = 0, -float("inf")
+        cache = IncrementalEvaluator(self.model)
+        best_action, best_score = actions[0], -float("inf")
         try:
             root = self.api.begin(observation, predictions)
-            for index in range(count):
-                child = self.api.step(root["searchId"], [index])
+            # SearchStep branches from this ID; every alternative has the same parent.
+            # Only apply indices to a determinization that preserved the offered options.
+            if root["observation"]["select"]["option"] != selection["option"]:
+                self.stats["root_option_fallbacks"] += 1
+                return priority_action(observation, rng)
+            cache.sync(position_from_observation(observation, self.schema_id))
+            for action in actions:
+                child = self.api.step(root["searchId"], action)
                 try:
                     child_observation = child["observation"]
                     state = child_observation["current"]
                     if state["result"] >= 0:
                         score = 0.0 if state["result"] == 2 else (1.0 if state["result"] == root_player else -1.0)
+                        self.stats["terminal_leaves"] += 1
                     else:
-                        score = self.model.evaluate_position(position_from_observation(child_observation)).item()
+                        position = position_from_observation(child_observation, self.schema_id)
+                        if position.observer == root_player:
+                            cache.push()
+                            try:
+                                cache.update(position)
+                                score = cache.value().item()
+                            finally:
+                                cache.pop()
+                            self.stats["incremental_leaves"] += 1
+                        else:
+                            # The opponent's private view here belongs to the sampled world.
+                            score = -self.model.evaluate_position(position).item()
+                            self.stats["perspective_switch_leaves"] += 1
                         score = max(-1.0, min(1.0, score))
-                        if state["yourIndex"] != root_player:
-                            score = -score
                     if score > best_score:
-                        best_index, best_score = index, score
+                        best_action, best_score = action, score
                     self.stats["evaluated_actions"] += 1
                 finally:
                     self.api.release(child["searchId"])
             self.stats["searched_decisions"] += 1
-            return [best_index]
+            return best_action
         finally:
             self.api.end()
 
@@ -173,13 +203,21 @@ def select_deck(agent, pool, rng, game_number):
     return name, deck
 
 
-def validate_action(observation, action):
-    selection = observation["select"]
-    if (not isinstance(action, list) or any(type(i) is not int for i in action) or
-            len(set(action)) != len(action) or
-            not selection["minCount"] <= len(action) <= selection["maxCount"] or
-            any(i < 0 or i >= len(selection["option"]) for i in action)):
-        raise ValueError(f"agent returned an invalid selection: {action}")
+def kaggle_agent(policy, own_deck, seed=7):
+    """Build Kaggle's agent(observation) entry point with its initial deck handshake."""
+    deck = list(own_deck)
+    check_deck_shape(deck)
+    rng = random.Random(seed)
+
+    def agent(observation):
+        if observation["select"] is None:
+            policy.start_game(list(deck))
+            return list(deck)
+        action = policy(observation, rng)
+        validate_action(observation, action)
+        return action
+
+    return agent
 
 
 def play_game(game, sim, agents, selected_decks, seats, action_rngs, max_steps):

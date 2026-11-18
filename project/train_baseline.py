@@ -7,6 +7,7 @@ Targets are completed-game returns; search-score targets and PPO are separate wo
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 
@@ -15,6 +16,7 @@ from torch import nn
 
 from .agent.features import ENTITY_FEATURES, GLOBAL_FEATURES, SCHEMA_ID, position_from_observation
 from .agent.model import DeepSetsValue, batch_positions
+from .collect_matches import game_return, validate_action
 
 
 def read_examples(path):
@@ -23,11 +25,13 @@ def read_examples(path):
         for line_number, line in enumerate(stream, 1):
             row = json.loads(line)
             observer, result = row["observer"], row["result"]
-            expected = 0.0 if result == 2 else (1.0 if result == observer else -1.0)
-            if (result not in (0, 1, 2) or row["target"] != expected or
-                    row["observation"]["current"]["yourIndex"] != observer):
+            expected = game_return(result, observer)
+            observation = row["observation"]
+            if row["target"] != expected or observation["current"]["yourIndex"] != observer:
                 raise ValueError(f"inconsistent perspective/outcome on line {line_number}")
-            examples.append((row["match_id"], position_from_observation(row["observation"]), expected))
+            if "action" in row:
+                validate_action(observation, row["action"])
+            examples.append((row["match_id"], position_from_observation(observation), expected))
     if not examples:
         raise ValueError("empty training dataset")
     return examples
@@ -43,7 +47,92 @@ def measure(model, examples, batch_size, loss_fn, device):
         targets = torch.tensor([item[2] for item in batch], device=device)
         total += loss_fn(predictions, targets).item() * len(batch)
         mse += (predictions - targets).square().sum().item()
-    return {"loss": total / len(examples), "mse": mse / len(examples)}
+    metrics = {"loss": total / len(examples), "mse": mse / len(examples)}
+    if not all(math.isfinite(value) for value in metrics.values()):
+        raise RuntimeError("nonfinite evaluation loss or MSE")
+    return metrics
+
+
+def train_value(train, validation, output, *, epochs, batch_size, lr, loss_name,
+                seed, device, provenance, initial_checkpoint=None, include_initial=False):
+    """Fit both networks jointly; normally select among epochs that received updates."""
+    if output.exists() or output.with_suffix(".json").exists():
+        raise FileExistsError(f"checkpoint or report already exists for {output}")
+    if epochs < 1 or batch_size < 1 or lr <= 0 or loss_name not in ("huber", "mse"):
+        raise ValueError("invalid value-training configuration")
+    train_groups, validation_groups = ({item[0] for item in data} for data in (train, validation))
+    if not train_groups or not validation_groups or train_groups & validation_groups:
+        raise ValueError("training and validation must contain disjoint, nonempty game groups")
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    model = DeepSetsValue().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    if initial_checkpoint is not None:
+        source = torch.load(initial_checkpoint, map_location=device, weights_only=True)
+        if source["metadata"]["schema_id"] != SCHEMA_ID:
+            raise ValueError("checkpoint feature schema mismatch")
+        model.load_state_dict(source["model"])
+        optimizer.load_state_dict(source["optimizer"])
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+    loss_fn = nn.MSELoss() if loss_name == "mse" else nn.HuberLoss(delta=0.2)
+    metadata = {
+        "schema_id": SCHEMA_ID, "entity_features": ENTITY_FEATURES,
+        "global_features": GLOBAL_FEATURES, "history": "32 zero slots",
+        "train_groups": sorted(train_groups),
+        "validation_groups": sorted(validation_groups),
+        "train_positions": len(train), "validation_positions": len(validation),
+        "config": {"optimizer": "AdamW", "lr": lr, "loss": loss_name,
+                   "huber_delta": 0.2 if loss_name == "huber" else None,
+                   "batch_size": batch_size, "epochs": epochs, "seed": seed, "device": str(device),
+                   "include_initial_in_selection": include_initial},
+        "parameters": sum(p.numel() for p in model.parameters()),
+        **provenance,
+    }
+    print(f"Training positions: {len(train)}, validation positions: {len(validation)}")
+    print(f"Optimizer: AdamW, lr={lr}; loss={loss_name}")
+    history = []
+    best_loss = float("inf")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    updates = 0
+    for epoch in range(epochs + 1):
+        if epoch:
+            model.train()
+            rng.shuffle(train)
+            for start in range(0, len(train), batch_size):
+                batch = train[start:start + batch_size]
+                targets = torch.tensor([item[2] for item in batch], device=device)
+                optimizer.zero_grad(set_to_none=True)
+                predictions = model(*batch_positions([item[1] for item in batch], device))
+                loss = loss_fn(predictions, targets)
+                if not torch.isfinite(loss):
+                    raise RuntimeError("nonfinite training loss")
+                loss.backward()
+                optimizer.step()
+                updates += 1
+        metrics = {"epoch": epoch, "updates": updates,
+                   "train": measure(model, train, batch_size, loss_fn, device),
+                   "validation": measure(model, validation, batch_size, loss_fn, device)}
+        history.append(metrics)
+        print(f"Epoch {epoch:02d}: train={metrics['train']['loss']:.6f}, "
+              f"validation={metrics['validation']['loss']:.6f}", flush=True)
+        if (epoch or include_initial) and metrics["validation"]["loss"] < best_loss:
+            best_loss = metrics["validation"]["loss"]
+            checkpoint = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                          "epoch": epoch, "metrics": metrics, "metadata": metadata,
+                          "torch_rng": torch.get_rng_state(), "python_rng": rng.getstate()}
+            temporary = output.with_name(output.name + ".part")
+            torch.save(checkpoint, temporary)
+            temporary.replace(output)
+    report = {"metadata": metadata, "history": history, "best_validation_loss": best_loss}
+    output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Best validation checkpoint: {output}")
+    return report
+
+
+def dataset_hash(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def main():
@@ -57,69 +146,17 @@ def main():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or args.lr <= 0:
-        parser.error("epochs, batch-size, and lr must be positive")
-    if args.output.exists():
-        parser.error("output exists; choose a new checkpoint path")
-    torch.manual_seed(args.seed)
-    rng = random.Random(args.seed)
     examples = read_examples(args.data)
     groups = sorted({item[0] for item in examples})
     if len(groups) < 2:
         parser.error("at least two complete match groups are needed for a held-out split")
-    rng.shuffle(groups)
+    random.Random(args.seed).shuffle(groups)
     validation_groups = set(groups[:max(1, len(groups) // 5)])
     train = [item for item in examples if item[0] not in validation_groups]
     validation = [item for item in examples if item[0] in validation_groups]
-    model = DeepSetsValue().to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    loss_fn = nn.MSELoss() if args.loss == "mse" else nn.HuberLoss(delta=0.2)
-    metadata = {
-        "schema_id": SCHEMA_ID, "entity_features": ENTITY_FEATURES,
-        "global_features": GLOBAL_FEATURES, "history": "32 zero slots in v0",
-        "dataset_sha256": hashlib.sha256(args.data.read_bytes()).hexdigest(),
-        "train_groups": sorted(set(groups) - validation_groups),
-        "validation_groups": sorted(validation_groups),
-        "config": {key: str(value) if isinstance(value, Path) else value
-                   for key, value in vars(args).items()},
-        "parameters": sum(p.numel() for p in model.parameters()),
-    }
-    print(f"Training positions: {len(train)}, validation positions: {len(validation)}")
-    print(f"Optimizer: AdamW, lr={args.lr}; loss={args.loss}")
-    history = []
-    best_loss = float("inf")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    for epoch in range(args.epochs + 1):
-        if epoch:
-            model.train()
-            rng.shuffle(train)
-            for start in range(0, len(train), args.batch_size):
-                batch = train[start:start + args.batch_size]
-                targets = torch.tensor([item[2] for item in batch], device=args.device)
-                optimizer.zero_grad(set_to_none=True)
-                predictions = model(*batch_positions([item[1] for item in batch], args.device))
-                loss = loss_fn(predictions, targets)
-                if not torch.isfinite(loss):
-                    raise RuntimeError("nonfinite training loss")
-                loss.backward()
-                optimizer.step()
-        metrics = {"epoch": epoch,
-                   "train": measure(model, train, args.batch_size, loss_fn, args.device),
-                   "validation": measure(model, validation, args.batch_size, loss_fn, args.device)}
-        history.append(metrics)
-        print(f"Epoch {epoch:02d}: train={metrics['train']['loss']:.6f}, "
-              f"validation={metrics['validation']['loss']:.6f}", flush=True)
-        if metrics["validation"]["loss"] < best_loss:
-            best_loss = metrics["validation"]["loss"]
-            checkpoint = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                          "epoch": epoch, "metrics": metrics, "metadata": metadata,
-                          "torch_rng": torch.get_rng_state(), "python_rng": rng.getstate()}
-            temporary = args.output.with_name(args.output.name + ".part")
-            torch.save(checkpoint, temporary)
-            temporary.replace(args.output)
-    report = {"metadata": metadata, "history": history, "best_validation_loss": best_loss}
-    args.output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
-    print(f"Best validation checkpoint: {args.output}")
+    train_value(train, validation, args.output, epochs=args.epochs, batch_size=args.batch_size,
+                lr=args.lr, loss_name=args.loss, seed=args.seed, device=args.device,
+                provenance={"dataset_sha256": dataset_hash(args.data)}, include_initial=True)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,8 @@ def _project_ready(root):
     return all((root / name).is_file() for name in (
         "project/arena.py", "project/sample_sdk.py", "project/agent/model.py",
         "project/rl_baseline/train.py", "project/agent_template/agent.py",
-        "project/requirements-colab.txt"))
+        "project/requirements-colab.txt", "project/train_deep_sets.py",
+        "project/check_deep_sets_training.py"))
 
 
 def setup_project(repository_path="", *, repository_url=PUBLIC_REPOSITORY, repository_ref="main",
